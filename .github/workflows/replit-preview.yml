@@ -1,0 +1,52 @@
+name: Replit PR preview
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, closed]
+permissions: {}
+concurrency:
+  group: replit-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  preview:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.ref == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      # Use ONLY the workflow from the trusted base. Never check out or execute PR code here.
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          HOST: ${{ vars.PREVIEW_HOST_URL }}
+        with:
+          script: |
+            const host = new URL(process.env.HOST);
+            if (host.protocol !== 'https:' || host.href !== host.origin + '/') throw Error('PREVIEW_HOST_URL must be an HTTPS origin');
+            const {owner,repo}=context.repo, pr=context.payload.pull_request, n=pr.number;
+            const closed=context.payload.action==='closed', sha=pr.head.sha;
+            const fresh=await github.rest.pulls.get({owner,repo,pull_number:n});
+            if ((fresh.data.state==='closed')!==closed || (!closed && fresh.data.head.sha!==sha)) {core.notice('Superseded PR event');return;}
+            const base=host.origin, url=base+'/api/pr/'+n+'/', api=base+'/api/previews/'+n;
+            let html;
+            if (!closed) {
+              const {data}=await github.rest.repos.getContent({owner,repo,path:'demo/index.html',ref:sha});
+              if (data.type!=='file'||data.encoding!=='base64'||data.size>56000) throw Error('Expected demo/index.html under 56 KB');
+              const template=Buffer.from(data.content,'base64').toString('utf8');
+              if (!template.includes('{{SHA}}')) throw Error('Keep the {{SHA}} marker in demo/index.html');
+              html=template.replaceAll('{{SHA}}',sha.slice(0,8)).replaceAll('{{PR}}',String(n));
+            }
+            const token=await core.getIDToken('replit-pr-preview');
+            const r=await fetch(api,{method:closed?'DELETE':'PUT',redirect:'error',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:closed?undefined:JSON.stringify({sha,html})});
+            if (!r.ok) throw Error('Preview host returned '+r.status+'; check the repository ID and host settings');
+            const check=await fetch(url,{redirect:'error'});
+            if (closed ? check.status!==404 : (!check.ok || check.headers.get('x-preview-sha')!==sha || await check.text()!==html)) throw Error('Preview verification failed');
+            const marker='<!-- replit-static-pr-preview -->';
+            const body=marker+'\n'+(closed?'Replit preview removed.':`[Open Replit preview](${url}) · commit \`${sha.slice(0,8)}\``);
+            const args={owner,repo,issue_number:n};
+            for await(const page of github.paginate.iterator(github.rest.issues.listComments,{...args,per_page:100})) {
+              const prev=page.data.find(c=>c.user?.login==='github-actions[bot]' && c.body?.startsWith(marker));
+              if(prev){await github.rest.issues.updateComment({owner,repo,comment_id:prev.id,body});return;}
+            }
+            if(!closed) await github.rest.issues.createComment({...args,body});
